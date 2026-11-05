@@ -111,17 +111,19 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     voiceManager.setAISpeaking(isSpeaking);
   }, [isSpeaking]);
 
-  // Initialize and manage microphone in Voice Mode
+  // Initialize and manage microphone in Voice Mode.
+  // Muting no longer tears the mic pipeline down: it only silences the
+  // input (see handleToggleMic), so this effect depends on voiceMode alone.
   useEffect(() => {
     let isCancelled = false;
 
-    if (voiceMode && isMicEnabled) {
+    if (voiceMode) {
       voiceManager
         .initMic()
         .then((success) => {
           if (!isCancelled && success) {
             setMicPermissionError(null);
-            if (!isSpeaking && !isLoading) {
+            if (!isSpeaking && !isLoading && !voiceManager.isMicMuted()) {
               voiceManager.startListening();
             }
           }
@@ -141,7 +143,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       isCancelled = true;
       voiceManager.stop();
     };
-  }, [voiceMode, isMicEnabled]);
+  }, [voiceMode]);
 
   // Pause listening when AI is speaking or thinking, resume when idle
   useEffect(() => {
@@ -193,16 +195,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     onVoiceStatusChange('listening');
   };
 
+  // True mute: silences the mic input only. Voice chat stays on, the mic
+  // stream and session stay alive, and background noise can't be heard or
+  // trigger an interruption while muted. Unmuting resumes listening.
   const handleToggleMic = () => {
-    if (isMicEnabled) {
-      voiceManager.stop();
-      setIsMicEnabled(false);
+    const nextEnabled = !isMicEnabled;
+    setIsMicEnabled(nextEnabled);
+    voiceManager.setMuted(!nextEnabled);
+    if (!nextEnabled) {
       setMicLevel(0);
-    } else {
-      setIsMicEnabled(true);
-      voiceManager.initMic().then(() => {
-        voiceManager.startListening();
-      });
+      setLiveTranscript('');
     }
   };
 
