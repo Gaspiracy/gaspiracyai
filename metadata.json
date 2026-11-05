@@ -1,0 +1,6 @@
+{
+  "name": "GaspiracyAI",
+  "description": "The omniscient AI chatbot created by Gaspiracy Media™. Powered by Zorvathane and Sponge Pooling across all parallel universes.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
