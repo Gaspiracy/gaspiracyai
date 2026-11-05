@@ -181,6 +181,11 @@ export const GoldOrb: React.FC<GoldOrbProps> = ({
               <Radio className="w-3.5 h-3.5 text-orange-400 animate-spin" />
               <span className="text-orange-200">Consulting the Sponge Pool...</span>
             </>
+          ) : !isMicActive ? (
+            <>
+              <MicOff className="w-3.5 h-3.5 text-red-400" />
+              <span className="text-red-300 font-medium">Mic muted — voice chat still on</span>
+            </>
           ) : status === 'listening' ? (
             <>
               <span className="relative flex h-2 w-2">
@@ -239,8 +244,8 @@ export const GoldOrb: React.FC<GoldOrbProps> = ({
           </button>
         )}
 
-        {/* Mute/Unmute Mic Toggle */}
-        {!isSpeaking && onToggleMic && (
+        {/* Mute/Unmute Mic Toggle — always visible in voice chat, even while the AI is speaking, so the mic can be muted right after asking a question */}
+        {onToggleMic && (
           <button
             onClick={onToggleMic}
             className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-full transition-colors cursor-pointer ${
