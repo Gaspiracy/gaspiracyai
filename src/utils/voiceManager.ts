@@ -29,6 +29,7 @@ class GaspiracyVoiceManager {
   private recordedChunks: Blob[] = [];
 
   private isEnabled: boolean = false;
+  private isMuted: boolean = false;
   private isSpeakingAI: boolean = false;
 
   // VAD state
@@ -54,10 +55,51 @@ class GaspiracyVoiceManager {
   }
 
   /**
+   * True mute: silences the mic at the track level while keeping the voice
+   * session, mic stream, and VAD loop alive. Voice chat stays on; only the
+   * microphone input is muted, so background noise cannot be heard or
+   * trigger a barge-in. Unmuting resumes listening.
+   */
+  public setMuted(muted: boolean) {
+    if (muted === this.isMuted) return;
+    this.isMuted = muted;
+
+    if (this.mediaStream) {
+      this.mediaStream.getAudioTracks().forEach((track) => {
+        track.enabled = !muted;
+      });
+    }
+
+    // Reset VAD state so stale speech frames can't fire on unmute
+    this.hasSpokenInThisTurn = false;
+    this.speechFramesCount = 0;
+    this.silenceFramesCount = 0;
+
+    if (muted) {
+      if (this.recognition) {
+        try {
+          this.recognition.stop();
+        } catch (e) {}
+      }
+      if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+        try {
+          this.mediaRecorder.stop();
+        } catch (e) {}
+      }
+    } else if (this.isEnabled && !this.isSpeakingAI) {
+      this.startListening();
+    }
+  }
+
+  public isMicMuted(): boolean {
+    return this.isMuted;
+  }
+
+  /**
    * Get instantaneous mic volume level (0.0 to 1.0) with vocal sensitivity curve
    */
   public getMicLevel(): number {
-    if (!this.isEnabled || !this.analyser || !this.micData) return 0;
+    if (!this.isEnabled || this.isMuted || !this.analyser || !this.micData) return 0;
     try {
       this.analyser.getByteFrequencyData(this.micData as any);
       let sum = 0;
@@ -125,6 +167,17 @@ class GaspiracyVoiceManager {
 
     const checkLevel = () => {
       if (!this.isEnabled) {
+        this.animFrameId = requestAnimationFrame(checkLevel);
+        return;
+      }
+
+      // Muted: report silence and skip all speech detection, so background
+      // noise can't trigger a barge-in while muted. The loop keeps running
+      // so unmuting resumes instantly.
+      if (this.isMuted) {
+        if (this.callbacks) {
+          this.callbacks.onMicLevel(0);
+        }
         this.animFrameId = requestAnimationFrame(checkLevel);
         return;
       }
@@ -199,6 +252,8 @@ class GaspiracyVoiceManager {
    * Start listening for user speech
    */
   public startListening() {
+    // Never start capturing while muted
+    if (this.isMuted) return;
     this.isEnabled = true;
     this.isProcessingUtterance = false;
     this.hasSpokenInThisTurn = false;
@@ -210,6 +265,13 @@ class GaspiracyVoiceManager {
     // 1. Start MediaRecorder
     if (this.mediaStream) {
       try {
+        // Stop any previous recorder first so chunks don't double up
+        if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+          try {
+            this.mediaRecorder.stop();
+          } catch (e) {}
+        }
+
         const mimeType = MediaRecorder.isTypeSupported('audio/webm')
           ? 'audio/webm'
           : MediaRecorder.isTypeSupported('audio/mp4')
@@ -431,6 +493,12 @@ class GaspiracyVoiceManager {
    */
   public stop() {
     this.isEnabled = false;
+    this.isMuted = false;
+    if (this.mediaStream) {
+      this.mediaStream.getAudioTracks().forEach((track) => {
+        track.enabled = true;
+      });
+    }
     this.pauseListening();
     this.currentTranscript = '';
     if (this.animFrameId) {
