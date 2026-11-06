@@ -238,37 +238,67 @@ async function startServer() {
         return res.status(400).json({ error: 'Transcript is empty after stripping' });
       }
 
-      const cartesiaRes = await fetch('https://api.cartesia.ai/tts/bytes', {
-        method: 'POST',
-        headers: {
-          'X-API-Key': CARTESIA_API_KEY,
-          'Cartesia-Version': '2024-06-10',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model_id: 'sonic-3.6',
-          transcript: cleanTranscript,
-          voice: {
-            mode: 'id',
-            id: CARTESIA_VOICE_ID,
-          },
-          output_format: {
-            container: 'mp3',
-            bit_rate: 128000,
-            sample_rate: 44100,
-          },
-        }),
-      });
+      // Cartesia fetch with a hard timeout + one retry. Without this, a
+      // stalled upstream leaves the request hanging forever and the client
+      // hears nothing (no audio element is ever created).
+      const TTS_TIMEOUT_MS = 25000;
+      let audioBuffer: ArrayBuffer | null = null;
+      let lastError = '';
+      let timedOut = false;
 
-      if (!cartesiaRes.ok) {
-        const errorText = await cartesiaRes.text();
-        console.error('Cartesia API error:', cartesiaRes.status, errorText);
-        return res.status(cartesiaRes.status).json({
-          error: `Cartesia TTS failed: ${errorText}`,
-        });
+      for (let attempt = 0; attempt < 2 && !audioBuffer; attempt++) {
+        timedOut = false;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), TTS_TIMEOUT_MS);
+        try {
+          const attemptRes = await fetch('https://api.cartesia.ai/tts/bytes', {
+            method: 'POST',
+            headers: {
+              'X-API-Key': CARTESIA_API_KEY,
+              'Cartesia-Version': '2024-06-10',
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model_id: 'sonic-3.6',
+              transcript: cleanTranscript,
+              voice: {
+                mode: 'id',
+                id: CARTESIA_VOICE_ID,
+              },
+              output_format: {
+                container: 'mp3',
+                bit_rate: 128000,
+                sample_rate: 44100,
+              },
+            }),
+            signal: controller.signal,
+          });
+
+          if (!attemptRes.ok) {
+            lastError = await attemptRes.text().catch(() => '');
+            console.error(`Cartesia API error (attempt ${attempt + 1}):`, attemptRes.status, lastError.slice(0, 500));
+            continue;
+          }
+
+          // Same signal/timeout covers the body download, so a trickling
+          // response can't hang the request either.
+          audioBuffer = await attemptRes.arrayBuffer();
+        } catch (err: any) {
+          timedOut = err?.name === 'AbortError';
+          lastError = err?.message || String(err);
+          console.error(`Cartesia fetch failed (attempt ${attempt + 1}):`, lastError.slice(0, 500));
+        } finally {
+          clearTimeout(timeoutId);
+        }
       }
 
-      const audioBuffer = await cartesiaRes.arrayBuffer();
+      if (!audioBuffer) {
+        return res.status(timedOut ? 504 : 502).json({
+          error: timedOut
+            ? 'Cartesia TTS timed out — the voice service did not answer in time. Please try again.'
+            : `Cartesia TTS failed: ${lastError.slice(0, 300) || 'upstream error'}`,
+        });
+      }
 
       res.setHeader('Content-Type', 'audio/mpeg');
       res.setHeader('Content-Length', audioBuffer.byteLength.toString());
