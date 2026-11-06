@@ -31,6 +31,8 @@ class GaspiracyVoiceManager {
   private isEnabled: boolean = false;
   private isMuted: boolean = false;
   private isSpeakingAI: boolean = false;
+  private isListening: boolean = false;
+  private aiSpeechStartedAt: number = 0;
 
   // VAD state
   private hasSpokenInThisTurn: boolean = false;
@@ -48,6 +50,7 @@ class GaspiracyVoiceManager {
   public setAISpeaking(speaking: boolean) {
     this.isSpeakingAI = speaking;
     if (speaking) {
+      this.aiSpeechStartedAt = Date.now();
       this.hasSpokenInThisTurn = false;
       this.speechFramesCount = 0;
       this.silenceFramesCount = 0;
@@ -76,6 +79,7 @@ class GaspiracyVoiceManager {
     this.silenceFramesCount = 0;
 
     if (muted) {
+      this.isListening = false;
       if (this.recognition) {
         try {
           this.recognition.stop();
@@ -201,10 +205,20 @@ class GaspiracyVoiceManager {
       const SPEECH_THRESHOLD = 0.07;
 
       if (this.isSpeakingAI) {
-        // AI is talking: check if user starts speaking to interrupt (Barge-In)
-        if (currentLevel > SPEECH_THRESHOLD) {
+        // AI is talking: check if user starts speaking to interrupt (Barge-In).
+        // Hardened against the AI's own voice feeding back through the
+        // speakers into the live mic: ignore the first 500ms of AI speech
+        // (playback ramp-up is the loudest echo window), and require a
+        // louder, longer burst than room noise / speaker echo before
+        // treating it as a real interruption.
+        const BARGE_IN_THRESHOLD = 0.30;
+        const BARGE_IN_FRAMES = 18; // ~300ms at 60fps
+        const BARGE_IN_GRACE_MS = 500;
+        if (Date.now() - this.aiSpeechStartedAt < BARGE_IN_GRACE_MS) {
+          this.speechFramesCount = 0;
+        } else if (currentLevel > BARGE_IN_THRESHOLD) {
           this.speechFramesCount++;
-          if (this.speechFramesCount >= 4) {
+          if (this.speechFramesCount >= BARGE_IN_FRAMES) {
             console.log('Interruption detected: user spoke over AI');
             this.speechFramesCount = 0;
             if (this.callbacks) {
@@ -254,6 +268,10 @@ class GaspiracyVoiceManager {
   public startListening() {
     // Never start capturing while muted
     if (this.isMuted) return;
+    // Idempotent: if the pipeline is already listening, don't tear the
+    // recorder down and rebuild it — that churn is what made the mic
+    // indicator stop/start on every pause/resume toggle.
+    if (this.isListening) return;
     this.isEnabled = true;
     this.isProcessingUtterance = false;
     this.hasSpokenInThisTurn = false;
@@ -334,7 +352,9 @@ class GaspiracyVoiceManager {
           };
 
           rec.onend = () => {
-            if (this.isEnabled && !this.isSpeakingAI && !this.isProcessingUtterance) {
+            // Only auto-restart while actively listening: never while muted
+            // (muting stops recognition on purpose) or paused for AI speech.
+            if (this.isEnabled && this.isListening && !this.isMuted && !this.isSpeakingAI && !this.isProcessingUtterance) {
               try {
                 rec.start();
               } catch (e) {}
@@ -352,6 +372,8 @@ class GaspiracyVoiceManager {
       }
     }
 
+    this.isListening = true;
+
     if (this.callbacks) {
       this.callbacks.onStateChange('listening');
     }
@@ -363,6 +385,7 @@ class GaspiracyVoiceManager {
   public finishUtterance() {
     if (this.isProcessingUtterance) return;
     this.isProcessingUtterance = true;
+    this.isListening = false;
 
     const transcript = this.currentTranscript.trim();
 
@@ -389,6 +412,11 @@ class GaspiracyVoiceManager {
   }
 
   private async handleCapturedAudio(transcript: string) {
+    // Consume the recorded chunks now: with an idempotent startListening,
+    // stale chunks from this turn must not leak into the next turn's audio.
+    const chunks = this.recordedChunks;
+    this.recordedChunks = [];
+
     if (transcript) {
       // Primary: Web Speech API transcript captured
       this.currentTranscript = '';
@@ -399,13 +427,13 @@ class GaspiracyVoiceManager {
     }
 
     // Secondary: Transcribe recorded audio chunks via /api/transcribe
-    if (this.recordedChunks.length > 0) {
+    if (chunks.length > 0) {
       if (this.callbacks) {
         this.callbacks.onStateChange('transcribing');
       }
 
       try {
-        const audioBlob = new Blob(this.recordedChunks, {
+        const audioBlob = new Blob(chunks, {
           type: this.mediaRecorder?.mimeType || 'audio/webm',
         });
 
@@ -470,6 +498,7 @@ class GaspiracyVoiceManager {
    * Pause listening (when GaspiracyAI is speaking or thinking)
    */
   public pauseListening() {
+    this.isListening = false;
     this.isProcessingUtterance = false;
     this.hasSpokenInThisTurn = false;
     this.speechFramesCount = 0;
