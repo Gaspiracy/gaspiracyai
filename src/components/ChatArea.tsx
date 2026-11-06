@@ -118,6 +118,15 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     let isCancelled = false;
 
     if (voiceMode) {
+      // Fresh voice session: the mic starts live so the UI toggle and the
+      // manager agree. (Previously the toggle could stay "off" while the
+      // manager was unmuted after a voice-mode off/on cycle, leaving the
+      // mic live while the UI showed it muted.)
+      setIsMicEnabled(true);
+      if (voiceManager.isMicMuted()) {
+        voiceManager.setMuted(false);
+      }
+
       voiceManager
         .initMic()
         .then((success) => {
