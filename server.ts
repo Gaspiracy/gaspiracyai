@@ -16,6 +16,11 @@ if (!CARTESIA_API_KEY) console.warn('CARTESIA_API_KEY is not set: /api/tts will 
 if (!process.env.GEMINI_API_KEY) console.warn('GEMINI_API_KEY is not set: chat will use canned fallback replies.');
 const CARTESIA_VOICE_ID = '387dcf2c-1402-4a3b-abdf-bfec02a48329';
 
+// Per-model LLM timeout. Was 2,500 ms — shorter than a normal Gemini call
+// with the ~5 KB system prompt, so EVERY chat call burned 2.5 s x 2 models
+// and fell back to a canned line. 15 s lets real replies come back.
+const CHAT_MODEL_TIMEOUT_MS = 15000;
+
 // Initialize Gemini client strictly on server with User-Agent
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
@@ -182,7 +187,7 @@ async function startServer() {
       for (const model of modelsToTry) {
         try {
           const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('Model timeout')), 2500)
+            setTimeout(() => reject(new Error('Model timeout')), CHAT_MODEL_TIMEOUT_MS)
           );
 
           const generatePromise = ai.models.generateContent({
@@ -220,6 +225,29 @@ async function startServer() {
       });
     }
   });
+
+  // Bounded in-memory cache for TTS audio: repeat text (greetings, common
+  // phrases) is served without another Cartesia call. Small on purpose —
+  // the free Render instance has 512 MB and clips run ~50–150 KB each.
+  const TTS_CACHE_MAX_ENTRIES = 30;
+  const ttsCache = new Map<string, Buffer>();
+  function ttsCacheGet(key: string): Buffer | undefined {
+    const hit = ttsCache.get(key);
+    if (hit) {
+      ttsCache.delete(key);
+      ttsCache.set(key, hit);
+    }
+    return hit;
+  }
+  function ttsCacheSet(key: string, buf: Buffer) {
+    if (ttsCache.has(key)) ttsCache.delete(key);
+    ttsCache.set(key, buf);
+    while (ttsCache.size > TTS_CACHE_MAX_ENTRIES) {
+      const oldest = ttsCache.keys().next().value;
+      if (oldest === undefined) break;
+      ttsCache.delete(oldest);
+    }
+  }
 
   // Cartesia Text-to-Speech proxy endpoint
   app.post('/api/tts', async (req, res) => {
@@ -307,6 +335,163 @@ async function startServer() {
     } catch (err: any) {
       console.error('Cartesia TTS error:', err);
       res.status(500).json({ error: err.message || 'TTS generation failed' });
+    }
+  });
+
+  // Streaming TTS endpoint: pipes Cartesia's /tts/bytes body straight
+  // through as chunked audio/mpeg instead of buffering the whole MP3
+  // first. The browser can start playing as soon as the first chunk
+  // arrives (~0.3 s) rather than waiting for the full clip (~1.4 s).
+  // Same voice, model, and output format as /api/tts, which stays as
+  // the buffered fallback for clients without MediaSource support.
+  app.post('/api/tts-stream', async (req, res) => {
+    try {
+      const { text } = req.body;
+      if (!text || typeof text !== 'string') {
+        return res.status(400).json({ error: 'Text string is required for speech' });
+      }
+
+      if (!CARTESIA_API_KEY) {
+        return res.status(500).json({ error: 'TTS is not configured (missing CARTESIA_API_KEY)' });
+      }
+
+      const cleanTranscript = stripFormattingForSpeech(text);
+      if (!cleanTranscript) {
+        return res.status(400).json({ error: 'Transcript is empty after stripping' });
+      }
+
+      // Cache hit: serve the stored clip immediately.
+      const cacheKey = cleanTranscript.toLowerCase().replace(/\s+/g, ' ').trim();
+      const cached = ttsCacheGet(cacheKey);
+      if (cached) {
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Content-Length', cached.byteLength.toString());
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.setHeader('X-TTS-Cache', 'HIT');
+        return res.send(cached);
+      }
+
+      const TTS_STREAM_FIRST_BYTE_MS = 25000;
+      const TTS_STREAM_STALL_MS = 15000;
+      let upstream: Response | null = null;
+      let lastError = '';
+      let timedOut = false;
+
+      for (let attempt = 0; attempt < 2 && !upstream; attempt++) {
+        timedOut = false;
+        const controller = new AbortController();
+        const firstByteTimer = setTimeout(() => controller.abort(), TTS_STREAM_FIRST_BYTE_MS);
+        try {
+          const attemptRes = await fetch('https://api.cartesia.ai/tts/bytes', {
+            method: 'POST',
+            headers: {
+              'X-API-Key': CARTESIA_API_KEY,
+              'Cartesia-Version': '2024-06-10',
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model_id: 'sonic-3.6',
+              transcript: cleanTranscript,
+              voice: {
+                mode: 'id',
+                id: CARTESIA_VOICE_ID,
+              },
+              output_format: {
+                container: 'mp3',
+                bit_rate: 128000,
+                sample_rate: 44100,
+              },
+            }),
+            signal: controller.signal,
+          });
+          clearTimeout(firstByteTimer);
+
+          if (!attemptRes.ok) {
+            lastError = await attemptRes.text().catch(() => '');
+            console.error(`Cartesia stream API error (attempt ${attempt + 1}):`, attemptRes.status, lastError.slice(0, 500));
+            continue;
+          }
+          if (!attemptRes.body) {
+            lastError = 'Cartesia returned no response body';
+            continue;
+          }
+          upstream = attemptRes;
+        } catch (err: any) {
+          clearTimeout(firstByteTimer);
+          timedOut = err?.name === 'AbortError';
+          lastError = err?.message || String(err);
+          console.error(`Cartesia stream fetch failed (attempt ${attempt + 1}):`, lastError.slice(0, 500));
+        }
+      }
+
+      if (!upstream || !upstream.body) {
+        return res.status(timedOut ? 504 : 502).json({
+          error: timedOut
+            ? 'Cartesia TTS timed out — the voice service did not answer in time. Please try again.'
+            : `Cartesia TTS failed: ${lastError.slice(0, 300) || 'upstream error'}`,
+        });
+      }
+
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('X-TTS-Cache', 'MISS');
+      // No Content-Length: chunked transfer, so the client plays as bytes arrive.
+      res.flushHeaders?.();
+
+      const reader = upstream.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let totalBytes = 0;
+      let sentAny = false;
+      let streamError: Error | null = null;
+
+      try {
+        for (;;) {
+          // Stall guard: abort if Cartesia stops sending mid-stream.
+          const stallTimer = setTimeout(() => {
+            streamError = new Error('Cartesia stream stalled');
+            reader.cancel().catch(() => {});
+          }, TTS_STREAM_STALL_MS);
+          let read;
+          try {
+            read = await reader.read();
+          } finally {
+            clearTimeout(stallTimer);
+          }
+          if (streamError) throw streamError;
+          if (read.done) break;
+          const value = read.value;
+          if (value && value.length > 0) {
+            chunks.push(value);
+            totalBytes += value.length;
+            sentAny = true;
+            res.write(Buffer.from(value));
+          }
+        }
+      } catch (err: any) {
+        console.error('Cartesia stream interrupted:', err?.message || err);
+        // If nothing was sent yet, the client can still fall back to /api/tts.
+        if (!sentAny && !res.headersSent) {
+          return res.status(502).json({ error: 'Cartesia TTS stream interrupted before any audio arrived. Please try again.' });
+        }
+        // Mid-stream failure: end the response so the client stops waiting.
+      } finally {
+        try { reader.releaseLock(); } catch {}
+      }
+
+      if (sentAny && totalBytes > 0) {
+        // Cache the completed clip for repeat phrases (bounded, see above).
+        try {
+          ttsCacheSet(cacheKey, Buffer.concat(chunks.map((c) => Buffer.from(c))));
+        } catch {}
+      }
+      res.end();
+    } catch (err: any) {
+      console.error('Cartesia TTS stream error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: err.message || 'TTS streaming failed' });
+      } else {
+        res.end();
+      }
     }
   });
 
