@@ -14,7 +14,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY;
 if (!CARTESIA_API_KEY) console.warn('CARTESIA_API_KEY is not set: /api/tts will return an error.');
 if (!process.env.GEMINI_API_KEY) console.warn('GEMINI_API_KEY is not set: chat will use canned fallback replies.');
-const CARTESIA_VOICE_ID = '387dcf2c-1402-4a3b-abdf-bfec02a48329';
+const CARTESIA_VOICE_ID = '4fd3b995-4fba-4b84-ba02-f073fdb9ef67';
 
 // Per-model LLM timeout. Was 2,500 ms — shorter than a normal Gemini call
 // with the ~5 KB system prompt, so EVERY chat call burned 2.5 s x 2 models
