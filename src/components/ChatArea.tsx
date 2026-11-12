@@ -115,7 +115,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
   // Initialize and manage microphone in Voice Mode.
   // Muting no longer tears the mic pipeline down: it only silences the
-  // input (see handleToggleMic), so this effect depends on voiceMode alone.
+  // input (see handleToggleMic).
   // The mic only starts once the user has explicitly pressed the
   // voice-chat button in this session (voiceActivated): a restored
   // voiceMode=true from a previous visit never activates the mic on load.
@@ -205,8 +205,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     onStopSpeaking();
     audioManager.stop();
     setLiveTranscript('');
-    voiceManager.startListening();
-    onVoiceStatusChange('listening');
+    // Only resume the mic once voice chat has been activated this session;
+    // before that, the orb's buttons must not start listening on their own.
+    if (voiceActivated) {
+      voiceManager.startListening();
+      onVoiceStatusChange('listening');
+    }
   };
 
   // True mute: silences the mic input only. Voice chat stays on, the mic
@@ -356,7 +360,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               onStopSpeaking={onStopSpeaking}
               onInterruptAndSpeak={handleManualInterrupt}
               onToggleMic={handleToggleMic}
-              onDoneSpeaking={() => voiceManager.finishUtterance()}
+              onDoneSpeaking={() => {
+                if (voiceActivated) voiceManager.finishUtterance();
+              }}
             />
           </div>
         )}
