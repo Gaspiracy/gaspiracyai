@@ -229,6 +229,14 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   };
 
   const handlePlayVoice = async (msg: Message) => {
+    // If this message is the one currently playing, the button is a Stop
+    // button. Otherwise it always plays this message (stopping anything
+    // else first) — never a silent no-op while other audio is playing.
+    if (isSpeaking && activeVoiceMsgId === msg.id) {
+      onStopSpeaking();
+      setActiveVoiceMsgId(null);
+      return;
+    }
     setActiveVoiceMsgId(msg.id);
     try {
       await onPlayMessageVoice(msg);

@@ -176,11 +176,13 @@ export default function App() {
   };
 
   const handlePlayMessageVoice = async (message: Message) => {
-    if (isSpeaking) {
-      audioManager.stop();
-      return;
-    }
-
+    // Listen always plays the selected message: any current audio is
+    // stopped first (playText does that itself). The Stop behavior lives
+    // in ChatArea, which knows which message is actually playing — a
+    // Listen tap must never silently do nothing while other audio plays.
+    // Optimistic speaking flag: keep the mic off from the moment
+    // playback starts, not from the moment audio is first heard.
+    setIsSpeaking(true);
     try {
       setConversations((prev) =>
         prev.map((c) =>
@@ -229,6 +231,10 @@ export default function App() {
             : c
         )
       );
+    } finally {
+      // Clear the optimistic flag if audio never actually started (on a
+      // normal finish the manager's own notify(false) already cleared it).
+      if (!audioManager.getSpeaking()) setIsSpeaking(false);
     }
   };
 
@@ -329,6 +335,11 @@ export default function App() {
       // In Voice Mode, start speaking immediately with Cartesia TTS and await completion
       if (voiceMode) {
         setVoiceStatus('speaking');
+        // Optimistic: keep the mic off from the moment TTS starts, not
+        // from the moment audio is first heard — otherwise the mic goes
+        // live in the gap between isLoading=false and playback starting
+        // and can hear the AI's own voice.
+        setIsSpeaking(true);
         try {
           await audioManager.playText(
             assistantReply,
@@ -355,6 +366,10 @@ export default function App() {
         } catch (ttsErr) {
           console.warn('Voice auto-play error:', ttsErr);
           setVoiceStatus(voiceActivated ? 'listening' : 'idle');
+        } finally {
+          // Clear the optimistic flag if audio never actually started (on
+          // a normal finish the manager's own notify(false) already did).
+          if (!audioManager.getSpeaking()) setIsSpeaking(false);
         }
       } else {
         setVoiceStatus('idle');

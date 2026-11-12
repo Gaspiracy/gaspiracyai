@@ -245,8 +245,10 @@ class GaspiracyVoiceManager {
           if (this.hasSpokenInThisTurn) {
             this.silenceFramesCount++;
 
-            // ~45 frames at 60fps = ~750ms of silence after speaking
-            if (this.silenceFramesCount >= 45) {
+            // ~72 frames at 60fps = ~1200ms of silence after speaking.
+            // Long enough that a natural mid-sentence pause doesn't split
+            // one question into two submissions.
+            if (this.silenceFramesCount >= 72) {
               console.log('VAD: silence detected after user speech. Triggering finishUtterance.');
               this.silenceFramesCount = 0;
               this.hasSpokenInThisTurn = false;
@@ -495,11 +497,13 @@ class GaspiracyVoiceManager {
   }
 
   /**
-   * Pause listening (when GaspiracyAI is speaking or thinking)
+   * Pause listening (when GaspiracyAI is speaking or thinking).
+   * Deliberately does NOT clear isProcessingUtterance: the guard stays up
+   * from submission until listening resumes (startListening clears it),
+   * so VAD can't double-submit the same turn during the thinking phase.
    */
   public pauseListening() {
     this.isListening = false;
-    this.isProcessingUtterance = false;
     this.hasSpokenInThisTurn = false;
     this.speechFramesCount = 0;
     this.silenceFramesCount = 0;
@@ -529,6 +533,8 @@ class GaspiracyVoiceManager {
       });
     }
     this.pauseListening();
+    // Full stop resets the in-flight guard (pauseListening no longer does).
+    this.isProcessingUtterance = false;
     this.currentTranscript = '';
     if (this.animFrameId) {
       cancelAnimationFrame(this.animFrameId);
