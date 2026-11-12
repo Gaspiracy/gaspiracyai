@@ -266,6 +266,19 @@ async function startServer() {
         return res.status(400).json({ error: 'Transcript is empty after stripping' });
       }
 
+      // Cache hit: the same text may already have been synthesized for a
+      // /api/tts-stream request (e.g. a streaming setup failure that fell
+      // back here) — serve the stored clip instead of a second synthesis.
+      const cacheKey = cleanTranscript.toLowerCase().replace(/\s+/g, ' ').trim();
+      const cached = ttsCacheGet(cacheKey);
+      if (cached) {
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Content-Length', cached.byteLength.toString());
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.setHeader('X-TTS-Cache', 'HIT');
+        return res.send(cached);
+      }
+
       // Cartesia fetch with a hard timeout + one retry. Without this, a
       // stalled upstream leaves the request hanging forever and the client
       // hears nothing (no audio element is ever created).
@@ -327,6 +340,10 @@ async function startServer() {
             : `Cartesia TTS failed: ${lastError.slice(0, 300) || 'upstream error'}`,
         });
       }
+
+      // Cache the completed clip so a repeat (or a streaming fallback for
+      // the same text) doesn't synthesize again.
+      try { ttsCacheSet(cacheKey, Buffer.from(audioBuffer)); } catch {}
 
       res.setHeader('Content-Type', 'audio/mpeg');
       res.setHeader('Content-Length', audioBuffer.byteLength.toString());
