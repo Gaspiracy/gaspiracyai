@@ -29,15 +29,24 @@ export default function App() {
     }
   });
 
-  // Default Voice Mode to true for direct voice-to-voice experience
+  // Default Voice Mode to OFF: voice chat must never start on its own.
+  // The stored preference is still honoured for the toggle itself, but
+  // the microphone only activates after an explicit press in this
+  // session (see voiceActivated below).
   const [voiceMode, setVoiceMode] = useState<boolean>(() => {
     try {
       const stored = localStorage.getItem(STORAGE_KEY_VOICE_MODE);
-      return stored !== null ? JSON.parse(stored) : true;
+      return stored !== null ? JSON.parse(stored) : false;
     } catch {
-      return true;
+      return false;
     }
   });
+
+  // Session-only gate: true only after the user has pressed the
+  // voice-chat button in THIS session. Never persisted — a fresh page
+  // load always starts with the mic off, even if voice mode was on
+  // last visit.
+  const [voiceActivated, setVoiceActivated] = useState(false);
 
   const [isLoading, setIsLoading] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -80,7 +89,7 @@ export default function App() {
       if (speaking) {
         setVoiceStatus('speaking');
       } else {
-        setVoiceStatus(voiceMode ? 'listening' : 'idle');
+        setVoiceStatus(voiceMode && voiceActivated ? 'listening' : 'idle');
       }
     });
 
@@ -88,7 +97,7 @@ export default function App() {
       unsubscribe();
       audioManager.stop();
     };
-  }, [voiceMode]);
+  }, [voiceMode, voiceActivated]);
 
   // Ensure active conversation exists or select first
   useEffect(() => {
@@ -139,8 +148,18 @@ export default function App() {
   }, []);
 
   const handleToggleVoiceMode = () => {
+    // Restored voice mode (ON from a previous visit) starts with the mic
+    // off: the first press in this session activates it instead of
+    // turning voice mode off, so one tap always gets the user talking.
+    if (voiceMode && !voiceActivated) {
+      setVoiceActivated(true);
+      audioManager.unlock();
+      setVoiceStatus('listening');
+      return;
+    }
     const nextMode = !voiceMode;
     setVoiceMode(nextMode);
+    setVoiceActivated(nextMode);
     audioManager.unlock();
     if (!nextMode) {
       audioManager.stop();
@@ -153,7 +172,7 @@ export default function App() {
   const handleStopSpeaking = () => {
     audioManager.stop();
     setIsSpeaking(false);
-    setVoiceStatus(voiceMode ? 'listening' : 'idle');
+    setVoiceStatus(voiceMode && voiceActivated ? 'listening' : 'idle');
   };
 
   const handlePlayMessageVoice = async (message: Message) => {
@@ -332,10 +351,10 @@ export default function App() {
             }
           );
           // When speech finishes, automatically resume listening
-          setVoiceStatus('listening');
+          setVoiceStatus(voiceActivated ? 'listening' : 'idle');
         } catch (ttsErr) {
           console.warn('Voice auto-play error:', ttsErr);
-          setVoiceStatus('listening');
+          setVoiceStatus(voiceActivated ? 'listening' : 'idle');
         }
       } else {
         setVoiceStatus('idle');
@@ -343,7 +362,7 @@ export default function App() {
     } catch (err: any) {
       console.error('Chat error:', err);
       setIsLoading(false);
-      setVoiceStatus(voiceMode ? 'listening' : 'idle');
+      setVoiceStatus(voiceMode && voiceActivated ? 'listening' : 'idle');
 
       const errorMessage: Message = {
         id: `msg_err_${Date.now()}`,
@@ -386,6 +405,7 @@ export default function App() {
         onSendMessage={handleSendMessage}
         isLoading={isLoading}
         voiceMode={voiceMode}
+        voiceActivated={voiceActivated}
         onToggleVoiceMode={handleToggleVoiceMode}
         isSpeaking={isSpeaking}
         voiceStatus={voiceStatus}

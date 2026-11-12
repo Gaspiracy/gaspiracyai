@@ -24,6 +24,7 @@ interface ChatAreaProps {
   onSendMessage: (text: string) => Promise<void>;
   isLoading: boolean;
   voiceMode: boolean;
+  voiceActivated: boolean;
   onToggleVoiceMode: () => void;
   isSpeaking: boolean;
   voiceStatus: VoiceStatus;
@@ -38,6 +39,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onSendMessage,
   isLoading,
   voiceMode,
+  voiceActivated,
   onToggleVoiceMode,
   isSpeaking,
   voiceStatus,
@@ -114,10 +116,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   // Initialize and manage microphone in Voice Mode.
   // Muting no longer tears the mic pipeline down: it only silences the
   // input (see handleToggleMic), so this effect depends on voiceMode alone.
+  // The mic only starts once the user has explicitly pressed the
+  // voice-chat button in this session (voiceActivated): a restored
+  // voiceMode=true from a previous visit never activates the mic on load.
   useEffect(() => {
     let isCancelled = false;
 
-    if (voiceMode) {
+    if (voiceMode && voiceActivated) {
       // Fresh voice session: the mic starts live so the UI toggle and the
       // manager agree. (Previously the toggle could stay "off" while the
       // manager was unmuted after a voice-mode off/on cycle, leaving the
@@ -152,18 +157,18 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       isCancelled = true;
       voiceManager.stop();
     };
-  }, [voiceMode]);
+  }, [voiceMode, voiceActivated]);
 
   // Pause listening when AI is speaking or thinking, resume when idle
   useEffect(() => {
-    if (voiceMode && isMicEnabled) {
+    if (voiceMode && voiceActivated && isMicEnabled) {
       if (isSpeaking || isLoading) {
         voiceManager.pauseListening();
       } else {
         voiceManager.startListening();
       }
     }
-  }, [voiceMode, isMicEnabled, isSpeaking, isLoading]);
+  }, [voiceMode, voiceActivated, isMicEnabled, isSpeaking, isLoading]);
 
   const handleManualMicRetry = async () => {
     setMicPermissionError(null);
@@ -241,6 +246,20 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     'Explain the chemical and cosmic properties of Zorvathane.',
   ];
 
+  // Voice button labels: three states — off, on-but-mic-not-activated
+  // (restored from a previous visit), and fully active.
+  const voiceLabel = !voiceMode
+    ? 'Switch to Voice Chat'
+    : voiceActivated
+      ? 'Voice Chat: ON'
+      : 'Voice Chat: tap to start';
+  const voiceLabelShort = !voiceMode ? 'Voice' : voiceActivated ? 'Voice ON' : 'Tap to start';
+  const voiceTitle = !voiceMode
+    ? 'Switch to Voice Chat (🗣️)'
+    : voiceActivated
+      ? 'Exit Voice Chat'
+      : 'Voice chat is on — tap to activate your microphone';
+
   return (
     <div className="flex-1 flex flex-col h-screen bg-[#050507] text-zinc-100 relative overflow-hidden">
       {/* Top Header Bar */}
@@ -285,14 +304,14 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 ? 'bg-gradient-to-r from-amber-500 via-amber-600 to-orange-600 text-black shadow-amber-500/25 ring-2 ring-amber-400/40'
                 : 'bg-zinc-900 hover:bg-zinc-800 text-amber-400 border border-amber-500/30 hover:border-amber-500/60'
             }`}
-            title={voiceMode ? 'Exit Voice Chat' : 'Switch to Voice Chat (🗣️)'}
+            title={voiceTitle}
           >
             <span className="text-base leading-none select-none">🗣️</span>
             <span className="hidden xs:inline">
-              {voiceMode ? 'Voice Chat: ON' : 'Switch to Voice Chat'}
+              {voiceLabel}
             </span>
             <span className="xs:hidden">
-              {voiceMode ? 'Voice ON' : 'Voice'}
+              {voiceLabelShort}
             </span>
           </button>
         </div>
@@ -352,8 +371,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               </h2>
 
               <p className="mt-2.5 text-xs sm:text-sm text-zinc-400 max-w-xl leading-relaxed">
-                Created by Gaspiracy Media™. Powered by Zorvathane. Continuous voice-to-voice chat is
-                active—speak anytime to ask questions or interrupt.
+                Created by Gaspiracy Media™. Powered by Zorvathane.{' '}
+                {voiceMode
+                  ? 'Continuous voice-to-voice chat is active—speak anytime to ask questions or interrupt.'
+                  : 'Type a question below, or switch to voice chat to talk out loud.'}
               </p>
 
               {/* Suggestions Grid */}
@@ -549,7 +570,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       ? 'bg-amber-500 text-black shadow-md shadow-amber-500/30 ring-2 ring-amber-400'
                       : 'text-zinc-400 hover:text-amber-400 hover:bg-zinc-800/80'
                   }`}
-                  title={voiceMode ? 'Voice Chat Active (Click to turn off)' : 'Switch to Voice Chat (🗣️)'}
+                  title={voiceTitle}
                 >
                   <span className="text-lg leading-none select-none">🗣️</span>
                 </button>
@@ -573,7 +594,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               <div className="px-4 py-1.5 border-t border-zinc-800/40 bg-black/40 rounded-b-2xl flex items-center justify-between text-[10px] sm:text-[11px] text-zinc-500">
                 <div className="flex items-center gap-1.5">
                   <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
-                  <span>GaspiracyAI · Cartesia Voice ID: 5085bff8</span>
+                  <span>GaspiracyAI · Cartesia Voice ID: 554644dc</span>
                 </div>
               </div>
             </form>
