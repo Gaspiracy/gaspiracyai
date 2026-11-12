@@ -148,6 +148,23 @@ function stripFormattingForSpeech(text: string): string {
     .trim();
 }
 
+// Races a promise against a timeout; rejects with `message` if the
+// timeout wins. Used by the streaming endpoints so a hung upstream
+// fails fast instead of hanging the request.
+async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function startServer() {
   const app = express();
 
@@ -223,6 +240,126 @@ async function startServer() {
         reply:
           'The Sponge Pool registered temporary interdimensional turbulence. Zorvathane reserves remain steady, and probes confirm the horizon is undeniably flat.',
       });
+    }
+  });
+
+  // Streaming chat endpoint (SSE): same models, system instruction,
+  // history, and temperature as /api/chat, but tokens stream to the
+  // client as Gemini produces them, so the first words arrive in ~1-2 s
+  // instead of after the full 13-17 s reply. /api/chat stays untouched
+  // as the fallback. Events: {"delta": "..."} per chunk, then
+  // {"done": true, "reply": "<full text>"}.
+  app.post('/api/chat-stream', async (req, res) => {
+    try {
+      const { messages } = req.body;
+
+      if (!Array.isArray(messages) || messages.length === 0) {
+        return res.status(400).json({ error: 'Messages array is required' });
+      }
+
+      const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user')?.content || '';
+
+      const contents = messages.map((m: { role: string; content: string }) => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.content }],
+      }));
+
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+
+      const send = (obj: Record<string, unknown>) => {
+        if (!res.writableEnded && !res.destroyed) {
+          res.write(`data: ${JSON.stringify(obj)}\n\n`);
+        }
+      };
+
+      // First-token and inter-token timeouts: a hung stream must fail
+      // fast instead of leaving the client waiting forever.
+      const FIRST_TOKEN_MS = 20000;
+      const STALL_MS = 15000;
+
+      let fullText = '';
+      let sentAny = false;
+      const modelsToTry = ['gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+
+      for (const model of modelsToTry) {
+        // Never restart with another model mid-stream: it would produce
+        // different text and garble the reply. Keep the partial instead.
+        if (sentAny) break;
+        let iterator: AsyncIterator<any> | null = null;
+        try {
+          const stream = await withTimeout(
+            ai.models.generateContentStream({
+              model,
+              contents,
+              config: {
+                systemInstruction: GASPIRACY_SYSTEM_INSTRUCTION,
+                temperature: 0.9,
+                topP: 0.95,
+              },
+            }),
+            FIRST_TOKEN_MS,
+            'Gemini stream start timeout'
+          );
+
+          iterator = stream[Symbol.asyncIterator]();
+          let firstToken = true;
+          for (;;) {
+            if (res.destroyed || res.writableEnded) break;
+            const timeoutMs = firstToken ? FIRST_TOKEN_MS : STALL_MS;
+            const result = await withTimeout(
+              iterator.next(),
+              timeoutMs,
+              'Gemini stream timeout'
+            );
+            if (result.done) break;
+            firstToken = false;
+            const text = (result.value as any)?.text || '';
+            if (text) {
+              fullText += text;
+              sentAny = true;
+              send({ delta: text });
+            }
+          }
+          break; // stream completed (or client went away)
+        } catch (modelErr: any) {
+          console.warn(`Model ${model} stream unavailable:`, modelErr.message || modelErr);
+          // No tokens yet: try the next model. Partial tokens: keep them.
+          if (sentAny) break;
+        } finally {
+          // Release the generator so a hung/abandoned stream doesn't
+          // hold the upstream connection open. Fire-and-forget: never
+          // await it here, or a hung generator would block the fallback.
+          if (iterator) {
+            try {
+              const p = iterator.return?.();
+              if (p) p.catch(() => {});
+            } catch {}
+          }
+        }
+      }
+
+      if (!sentAny) {
+        // Same in-character fallback as /api/chat, streamed as one delta.
+        const fallback = generateInCharacterResponse(lastUserMsg);
+        fullText = fallback;
+        send({ delta: fallback });
+      }
+
+      send({ done: true, reply: fullText });
+      res.end();
+    } catch (err: any) {
+      console.error('Error streaming chat response:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: err.message || 'Chat streaming failed' });
+      } else {
+        try {
+          res.write(`data: ${JSON.stringify({ error: err.message || 'Chat streaming failed' })}\n\n`);
+        } catch {}
+        res.end();
+      }
     }
   });
 

@@ -8,6 +8,70 @@ const STORAGE_KEY_CONVERSATIONS = 'gaspiracy_conversations_v2';
 const STORAGE_KEY_ACTIVE_ID = 'gaspiracy_active_id_v2';
 const STORAGE_KEY_VOICE_MODE = 'gaspiracy_voice_mode_v2';
 
+// Streams a chat reply from /api/chat-stream (SSE). Calls onDelta with
+// each text chunk and the accumulated full text; resolves with the full
+// reply. Throws if the stream can't start or fails before any token, so
+// the caller can fall back to /api/chat. A mid-stream failure resolves
+// with whatever arrived so far.
+async function streamChat(
+  messages: { role: string; content: string }[],
+  onDelta: (delta: string, full: string) => void
+): Promise<{ reply: string; streamedAny: boolean }> {
+  const response = await fetch('/api/chat-stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages }),
+  });
+  if (!response.ok || !response.body) {
+    throw new Error(`Chat stream failed: HTTP ${response.status}`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let full = '';
+  let streamedAny = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const rawEvent = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        for (const line of rawEvent.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const payload = trimmed.slice(5).trim();
+          if (!payload) continue;
+          let event: any;
+          try {
+            event = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+          if (typeof event.delta === 'string' && event.delta) {
+            full += event.delta;
+            streamedAny = true;
+            onDelta(event.delta, full);
+          } else if (event.done) {
+            if (typeof event.reply === 'string') full = event.reply;
+            return { reply: full, streamedAny: true };
+          } else if (event.error) {
+            if (streamedAny) return { reply: full, streamedAny: true };
+            throw new Error(event.error);
+          }
+        }
+      }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+  // Stream ended without a done event: keep what arrived, if anything.
+  if (streamedAny) return { reply: full, streamedAny: true };
+  throw new Error('Chat stream ended without a reply');
+}
+
 export default function App() {
   const [conversations, setConversations] = useState<Conversation[]>(() => {
     try {
@@ -287,48 +351,75 @@ export default function App() {
     setIsLoading(true);
     setVoiceStatus('thinking');
 
-    try {
-      // Call server Gemini chat endpoint
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: updatedMessages.map((m) => ({
-            role: m.role,
-            content: m.content,
-          })),
-        }),
-      });
+    // The assistant message is created up front so streamed tokens can
+    // render into it as they arrive; the same id is reused by the
+    // non-streaming fallback and the TTS cache callback.
+    const assistantMessage: Message = {
+      id: `msg_a_${Date.now()}`,
+      role: 'assistant',
+      content: '',
+      timestamp: Date.now(),
+    };
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || `HTTP ${response.status}`);
-      }
-
-      const data = await response.json();
-      const assistantReply = data.reply || 'The Sponge Pool returned an anomalous silence.';
-
-      const assistantMessage: Message = {
-        id: `msg_a_${Date.now()}`,
-        role: 'assistant',
-        content: assistantReply,
-        timestamp: Date.now(),
-      };
-
-      const finalMessages = [...updatedMessages, assistantMessage];
-
-      // Immediately render the assistant text on screen
+    const upsertAssistantMessage = (content: string) => {
       setConversations((prev) =>
         prev.map((c) =>
           c.id === currentConvId
             ? {
                 ...c,
                 updatedAt: Date.now(),
-                messages: finalMessages,
+                messages: c.messages.some((m) => m.id === assistantMessage.id)
+                  ? c.messages.map((m) =>
+                      m.id === assistantMessage.id ? { ...m, content } : m
+                    )
+                  : [...c.messages, { ...assistantMessage, content }],
               }
             : c
         )
       );
+    };
+
+    try {
+      let assistantReply: string | null = null;
+
+      // Stream first: the first words arrive in ~1-2 s instead of after
+      // the full reply. If the stream can't start, fall back to the
+      // non-streaming endpoint. A mid-stream failure keeps the partial
+      // text already shown.
+      try {
+        const streamed = await streamChat(
+          updatedMessages.map((m) => ({ role: m.role, content: m.content })),
+          (_delta, full) => upsertAssistantMessage(full)
+        );
+        assistantReply = streamed.reply;
+      } catch (streamErr) {
+        console.warn('Chat stream failed, falling back to /api/chat:', streamErr);
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: updatedMessages.map((m) => ({
+              role: m.role,
+              content: m.content,
+            })),
+          }),
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(errorData.error || `HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        const fallbackReply: string = data.reply || 'The Sponge Pool returned an anomalous silence.';
+        assistantReply = fallbackReply;
+        upsertAssistantMessage(fallbackReply);
+      }
+
+      const finalReply = assistantReply || 'The Sponge Pool returned an anomalous silence.';
+      if (!assistantReply) {
+        upsertAssistantMessage(finalReply);
+      }
 
       setIsLoading(false);
 
@@ -342,7 +433,7 @@ export default function App() {
         setIsSpeaking(true);
         try {
           await audioManager.playText(
-            assistantReply,
+            finalReply,
             undefined,
             (blobUrl) => {
               setConversations((prev) =>
