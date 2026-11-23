@@ -63,3 +63,17 @@
 .animate-gold-drift {
   animation: gold-drift 24s linear infinite;
 }
+
+/* Install banner slides down from the top of the viewport */
+@keyframes install-slide-down {
+  from {
+    transform: translateY(-100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+.animate-install-slide-down {
+  animation: install-slide-down 0.4s ease-out;
+}

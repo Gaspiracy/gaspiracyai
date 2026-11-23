@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { Conversation, Message, VoiceStatus } from './types';
 import { Sidebar } from './components/Sidebar';
 import { ChatArea } from './components/ChatArea';
+import { InstallBanner } from './components/InstallBanner';
 import { audioManager } from './utils/audio';
 
 const STORAGE_KEY_CONVERSATIONS = 'gaspiracy_conversations_v2';
@@ -493,6 +494,9 @@ export default function App() {
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#050507]">
+      {/* PWA install banner: fixed overlay, does not affect layout */}
+      <InstallBanner />
+
       {/* Sidebar with conversation history and contact link */}
       <Sidebar
         conversations={conversations}
