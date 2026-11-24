@@ -16,6 +16,15 @@ if (!CARTESIA_API_KEY) console.warn('CARTESIA_API_KEY is not set: /api/tts will 
 if (!process.env.GEMINI_API_KEY) console.warn('GEMINI_API_KEY is not set: chat will use canned fallback replies.');
 const CARTESIA_VOICE_ID = '554644dc-1d38-426c-b627-3f2d264d8e99';
 
+// Groq (OpenAI-compatible) fallback. Groq is a separate provider from
+// Google, so it keeps answering when Gemini is overloaded. Model IDs
+// live in GROQ_MODELS: Groq retires models aggressively, so swapping
+// a dead ID is a one-line change. Skipped when no key is configured.
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+if (!GROQ_API_KEY) console.warn('GROQ_API_KEY is not set: Groq fallback will be skipped.');
+const GROQ_BASE_URL = 'https://api.groq.com/openai/v1';
+const GROQ_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
+
 // Per-model LLM timeout. Was 2,500 ms — shorter than a normal Gemini call
 // with the ~5 KB system prompt, so EVERY chat call burned 2.5 s x 2 models
 // and fell back to a canned line. 15 s lets real replies come back.
@@ -135,6 +144,135 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
   }
 }
 
+// Messages in OpenAI shape for Groq: the system instruction goes in
+// as a leading system message; user/assistant roles pass through.
+function groqMessages(messages: { role: string; content: string }[]) {
+  return [
+    { role: 'system', content: GASPIRACY_SYSTEM_INSTRUCTION },
+    ...messages.map((m) => ({ role: m.role, content: m.content })),
+  ];
+}
+
+// One non-streaming Groq chat call. Returns the reply text, or null
+// on any failure (HTTP error, timeout, empty reply). Never throws.
+async function groqChatCompletion(
+  model: string,
+  messages: { role: string; content: string }[],
+  timeoutMs: number
+): Promise<string | null> {
+  if (!GROQ_API_KEY) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        messages: groqMessages(messages),
+        temperature: 0.9,
+        top_p: 0.95,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      console.warn(`Groq model ${model} unavailable: HTTP ${res.status}`);
+      return null;
+    }
+    const data: any = await res.json();
+    const text = data?.choices?.[0]?.message?.content;
+    return typeof text === 'string' && text ? text : null;
+  } catch (err: any) {
+    console.warn(`Groq model ${model} unavailable:`, err.message || err);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Streams a Groq reply, calling onDelta with each text chunk as it
+// arrives. Returns the full text, or null when no tokens arrived.
+// Never throws; partial text already went out through onDelta.
+async function groqChatStream(
+  model: string,
+  messages: { role: string; content: string }[],
+  onDelta: (text: string) => void,
+  firstTokenMs: number,
+  stallMs: number
+): Promise<string | null> {
+  if (!GROQ_API_KEY) return null;
+  const controller = new AbortController();
+  try {
+    const res = await withTimeout(
+      fetch(`${GROQ_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages: groqMessages(messages),
+          temperature: 0.9,
+          top_p: 0.95,
+          stream: true,
+        }),
+        signal: controller.signal,
+      }),
+      firstTokenMs,
+      'Groq stream start timeout'
+    );
+    if (!res.ok || !res.body) {
+      console.warn(`Groq model ${model} stream unavailable: HTTP ${res.status}`);
+      return null;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let fullText = '';
+    let firstToken = true;
+    for (;;) {
+      const timeoutMs = firstToken ? firstTokenMs : stallMs;
+      const result = await withTimeout(reader.read(), timeoutMs, 'Groq stream timeout');
+      if (result.done) break;
+      buffer += decoder.decode(result.value, { stream: true });
+      // SSE events are separated by blank lines.
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const event = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        for (const line of event.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const payload = trimmed.slice(5).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const data = JSON.parse(payload);
+            const text = data?.choices?.[0]?.delta?.content || '';
+            if (text) {
+              firstToken = false;
+              fullText += text;
+              onDelta(text);
+            }
+          } catch {
+            // Ignore unparseable SSE lines.
+          }
+        }
+      }
+    }
+    return fullText || null;
+  } catch (err: any) {
+    console.warn(`Groq model ${model} stream unavailable:`, err.message || err);
+    return null;
+  } finally {
+    try { controller.abort(); } catch {}
+  }
+}
+
 async function startServer() {
   const app = express();
 
@@ -194,6 +332,15 @@ async function startServer() {
           }
         } catch (modelErr: any) {
           console.warn(`Model ${model} unavailable:`, modelErr.message || modelErr);
+        }
+      }
+
+      // Groq fallback: a different provider, so it answers when
+      // Google is overloaded. Skipped when no key is configured.
+      if (!reply && GROQ_API_KEY) {
+        for (const model of GROQ_MODELS) {
+          reply = await groqChatCompletion(model, messages, CHAT_MODEL_TIMEOUT_MS);
+          if (reply) break;
         }
       }
 
@@ -308,6 +455,25 @@ async function startServer() {
               if (p) p.catch(() => {});
             } catch {}
           }
+        }
+      }
+
+      // Groq fallback (streaming): same idea as /api/chat. Only runs
+      // when Gemini produced nothing. Skipped with no key configured.
+      if (!sentAny && GROQ_API_KEY) {
+        for (const model of GROQ_MODELS) {
+          await groqChatStream(
+            model,
+            messages,
+            (delta) => {
+              sentAny = true;
+              fullText += delta;
+              send({ delta });
+            },
+            FIRST_TOKEN_MS,
+            STALL_MS
+          );
+          if (sentAny) break;
         }
       }
 
