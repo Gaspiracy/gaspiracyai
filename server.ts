@@ -16,12 +16,12 @@ if (!CARTESIA_API_KEY) console.warn('CARTESIA_API_KEY is not set: /api/tts will 
 if (!process.env.GEMINI_API_KEY) console.warn('GEMINI_API_KEY is not set: chat will use canned fallback replies.');
 const CARTESIA_VOICE_ID = '554644dc-1d38-426c-b627-3f2d264d8e99';
 
-// Groq (OpenAI-compatible) fallback. Groq is a separate provider from
+// Groq (OpenAI-compatible) primary provider. Groq is a separate provider from
 // Google, so it keeps answering when Gemini is overloaded. Model IDs
 // live in GROQ_MODELS: Groq retires models aggressively, so swapping
 // a dead ID is a one-line change. Skipped when no key is configured.
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-if (!GROQ_API_KEY) console.warn('GROQ_API_KEY is not set: Groq fallback will be skipped.');
+if (!GROQ_API_KEY) console.warn('GROQ_API_KEY is not set: Groq will be skipped.');
 const GROQ_BASE_URL = 'https://api.groq.com/openai/v1';
 const GROQ_MODELS = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
 
@@ -300,8 +300,17 @@ async function startServer() {
 
       const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user')?.content || '';
 
-      // Try Gemini models with timeout
+      // Groq first: fast, and it keeps answering when Google is
+      // overloaded. Skipped when no key is configured.
       let reply: string | null = null;
+      if (GROQ_API_KEY) {
+        for (const model of GROQ_MODELS) {
+          reply = await groqChatCompletion(model, messages, CHAT_MODEL_TIMEOUT_MS);
+          if (reply) break;
+        }
+      }
+
+      // Gemini backup if Groq produced nothing.
       const modelsToTry = ['gemini-3.8-flash', 'gemini-3.1-flash-lite'];
 
       const contents = messages.map((m: { role: string; content: string }) => ({
@@ -310,6 +319,7 @@ async function startServer() {
       }));
 
       for (const model of modelsToTry) {
+        if (reply) break;
         try {
           const timeoutPromise = new Promise<never>((_, reject) =>
             setTimeout(() => reject(new Error('Model timeout')), CHAT_MODEL_TIMEOUT_MS)
@@ -332,15 +342,6 @@ async function startServer() {
           }
         } catch (modelErr: any) {
           console.warn(`Model ${model} unavailable:`, modelErr.message || modelErr);
-        }
-      }
-
-      // Groq fallback: a different provider, so it answers when
-      // Google is overloaded. Skipped when no key is configured.
-      if (!reply && GROQ_API_KEY) {
-        for (const model of GROQ_MODELS) {
-          reply = await groqChatCompletion(model, messages, CHAT_MODEL_TIMEOUT_MS);
-          if (reply) break;
         }
       }
 
@@ -399,6 +400,28 @@ async function startServer() {
 
       let fullText = '';
       let sentAny = false;
+
+      // Groq first (streaming): fast, and it keeps answering when
+      // Google is overloaded. Skipped with no key configured.
+      if (GROQ_API_KEY) {
+        for (const model of GROQ_MODELS) {
+          await groqChatStream(
+            model,
+            messages,
+            (delta) => {
+              sentAny = true;
+              fullText += delta;
+              send({ delta });
+            },
+            FIRST_TOKEN_MS,
+            STALL_MS
+          );
+          if (sentAny) break;
+        }
+      }
+
+      // Gemini backup if Groq produced nothing. The loop's first
+      // statement breaks out immediately when Groq already spoke.
       const modelsToTry = ['gemini-3.8-flash', 'gemini-3.1-flash-lite'];
 
       for (const model of modelsToTry) {
@@ -455,25 +478,6 @@ async function startServer() {
               if (p) p.catch(() => {});
             } catch {}
           }
-        }
-      }
-
-      // Groq fallback (streaming): same idea as /api/chat. Only runs
-      // when Gemini produced nothing. Skipped with no key configured.
-      if (!sentAny && GROQ_API_KEY) {
-        for (const model of GROQ_MODELS) {
-          await groqChatStream(
-            model,
-            messages,
-            (delta) => {
-              sentAny = true;
-              fullText += delta;
-              send({ delta });
-            },
-            FIRST_TOKEN_MS,
-            STALL_MS
-          );
-          if (sentAny) break;
         }
       }
 
